@@ -3,6 +3,11 @@ from groq import Groq
 from supabase import create_client, Client
 from datetime import datetime
 import hashlib
+from sentence_transformers import SentenceTransformer
+import PyPDF2
+from docx import Document
+import io
+import numpy as np
 
 # Initialize Groq client
 client = Groq(api_key=st.secrets["GROQ_API_KEY"])
@@ -12,6 +17,13 @@ supabase: Client = create_client(
     st.secrets["SUPABASE_URL"],
     st.secrets["SUPABASE_KEY"]
 )
+
+# Initialize embedding model (cached to avoid reloading)
+@st.cache_resource
+def load_embedding_model():
+    return SentenceTransformer('sentence-transformers/all-MiniLM-L6-v2')
+
+embedding_model = load_embedding_model()
 
 # Page config
 st.set_page_config(page_title="Simple Chatbot", page_icon="🤖", layout="wide")
@@ -115,6 +127,168 @@ def rename_session(session_id, new_name):
 def generate_session_name(first_message):
     words = first_message.split()[:4]
     return " ".join(words) if words else "New Chat"
+
+# RAG helper functions
+def extract_text_from_pdf(file):
+    try:
+        pdf_reader = PyPDF2.PdfReader(io.BytesIO(file.read()))
+        text = ""
+        for page in pdf_reader.pages:
+            text += page.extract_text() + "\n"
+        return text
+    except Exception as e:
+        st.error(f"Error reading PDF: {e}")
+        return None
+
+def extract_text_from_docx(file):
+    try:
+        doc = Document(io.BytesIO(file.read()))
+        text = "\n".join([paragraph.text for paragraph in doc.paragraphs])
+        return text
+    except Exception as e:
+        st.error(f"Error reading DOCX: {e}")
+        return None
+
+def extract_text_from_txt(file):
+    try:
+        return file.read().decode('utf-8')
+    except Exception as e:
+        st.error(f"Error reading TXT: {e}")
+        return None
+
+def chunk_text(text, chunk_size=800, overlap=100):
+    """Split text into overlapping chunks"""
+    chunks = []
+    start = 0
+    text_length = len(text)
+    
+    while start < text_length:
+        end = start + chunk_size
+        chunk = text[start:end]
+        
+        # Try to break at sentence end
+        if end < text_length:
+            last_period = chunk.rfind('.')
+            last_newline = chunk.rfind('\n')
+            break_point = max(last_period, last_newline)
+            
+            if break_point > chunk_size * 0.5:  # Only break if we're past halfway
+                chunk = chunk[:break_point + 1]
+                end = start + break_point + 1
+        
+        chunks.append(chunk.strip())
+        start = end - overlap
+    
+    return chunks
+
+def upload_document(session_id, filename, file):
+    """Process and store document with embeddings"""
+    try:
+        # Extract text based on file type
+        if filename.endswith('.pdf'):
+            text = extract_text_from_pdf(file)
+        elif filename.endswith('.docx'):
+            text = extract_text_from_docx(file)
+        elif filename.endswith('.txt'):
+            text = extract_text_from_txt(file)
+        else:
+            st.error("Unsupported file format. Please upload PDF, DOCX, or TXT files.")
+            return False
+        
+        if not text or len(text.strip()) < 10:
+            st.error("Could not extract text from document or document is too short.")
+            return False
+        
+        # Chunk the text
+        chunks = chunk_text(text)
+        
+        # Store document metadata
+        doc_response = supabase.table("documents").insert({
+            "session_id": session_id,
+            "filename": filename,
+            "content": text[:5000],  # Store first 5000 chars for preview
+            "chunks": chunks
+        }).execute()
+        
+        if not doc_response.data:
+            st.error("Failed to store document")
+            return False
+        
+        document_id = doc_response.data[0]['id']
+        
+        # Generate embeddings and store chunks
+        with st.spinner(f"Processing {len(chunks)} chunks..."):
+            for idx, chunk in enumerate(chunks):
+                # Generate embedding
+                embedding = embedding_model.encode(chunk).tolist()
+                
+                # Store chunk with embedding
+                supabase.table("document_chunks").insert({
+                    "document_id": document_id,
+                    "session_id": session_id,
+                    "chunk_text": chunk,
+                    "chunk_index": idx,
+                    "embedding": embedding
+                }).execute()
+        
+        return True
+        
+    except Exception as e:
+        st.error(f"Error uploading document: {e}")
+        return False
+
+def get_session_documents(session_id):
+    """Get all documents for a session"""
+    try:
+        response = supabase.table("documents").select("*").eq("session_id", session_id).execute()
+        return response.data
+    except Exception as e:
+        st.error(f"Error fetching documents: {e}")
+        return []
+
+def delete_document(document_id):
+    """Delete a document and its chunks"""
+    try:
+        supabase.table("documents").delete().eq("id", document_id).execute()
+        return True
+    except Exception as e:
+        st.error(f"Error deleting document: {e}")
+        return False
+
+def search_similar_chunks(session_id, query, top_k=3):
+    """Search for similar chunks using vector similarity"""
+    try:
+        # Generate query embedding
+        query_embedding = embedding_model.encode(query).tolist()
+        
+        # Get all chunks for this session
+        response = supabase.table("document_chunks").select("chunk_text, embedding").eq("session_id", session_id).execute()
+        
+        if not response.data:
+            return []
+        
+        # Calculate cosine similarity
+        chunks_with_scores = []
+        for chunk_data in response.data:
+            chunk_embedding = chunk_data['embedding']
+            
+            # Cosine similarity
+            similarity = np.dot(query_embedding, chunk_embedding) / (
+                np.linalg.norm(query_embedding) * np.linalg.norm(chunk_embedding)
+            )
+            
+            chunks_with_scores.append({
+                'text': chunk_data['chunk_text'],
+                'score': similarity
+            })
+        
+        # Sort by similarity and return top_k
+        chunks_with_scores.sort(key=lambda x: x['score'], reverse=True)
+        return chunks_with_scores[:top_k]
+        
+    except Exception as e:
+        st.error(f"Error searching chunks: {e}")
+        return []
 
 # Login/Register page
 if not st.session_state.user:
@@ -338,6 +512,37 @@ else:
         
         st.divider()
         
+        # RAG Settings
+        st.subheader("📚 Documents (RAG)")
+        use_rag = st.checkbox("Use uploaded documents", value=False, help="Enable to answer using your documents")
+        
+        # File upload
+        uploaded_file = st.file_uploader("Upload Document", type=['pdf', 'docx', 'txt'], help="Upload PDF, DOCX, or TXT files")
+        
+        if uploaded_file and st.session_state.current_session_id:
+            if st.button("📤 Upload & Process"):
+                if upload_document(st.session_state.current_session_id, uploaded_file.name, uploaded_file):
+                    st.success(f"✅ {uploaded_file.name} uploaded successfully!")
+                    st.rerun()
+        elif uploaded_file and not st.session_state.current_session_id:
+            st.warning("Please start a chat session first!")
+        
+        # Show uploaded documents
+        if st.session_state.current_session_id:
+            docs = get_session_documents(st.session_state.current_session_id)
+            if docs:
+                st.write(f"**📄 Uploaded ({len(docs)}):**")
+                for doc in docs:
+                    col1, col2 = st.columns([3, 1])
+                    with col1:
+                        st.write(f"• {doc['filename']}")
+                    with col2:
+                        if st.button("🗑️", key=f"del_doc_{doc['id']}"):
+                            if delete_document(doc['id']):
+                                st.rerun()
+        
+        st.divider()
+        
         # Session management
         st.subheader("💬 Chat Sessions")
         
@@ -421,9 +626,34 @@ else:
             message_placeholder = st.empty()
             
             try:
+                # Prepare messages for API
+                messages_for_api = [{"role": m["role"], "content": m["content"]} for m in st.session_state.messages]
+                
+                # If RAG is enabled, search for relevant context
+                context_used = None
+                if use_rag and st.session_state.current_session_id:
+                    relevant_chunks = search_similar_chunks(st.session_state.current_session_id, prompt, top_k=3)
+                    
+                    if relevant_chunks:
+                        # Build context from chunks
+                        context = "\n\n".join([f"[Context {i+1}]: {chunk['text']}" for i, chunk in enumerate(relevant_chunks)])
+                        
+                        # Modify the last user message to include context
+                        enhanced_prompt = f"""Based on the following context from uploaded documents, please answer the question.
+
+Context:
+{context}
+
+Question: {prompt}
+
+Please provide a detailed answer based on the context above. If the context doesn't contain relevant information, say so."""
+                        
+                        messages_for_api[-1]["content"] = enhanced_prompt
+                        context_used = f"📚 Using {len(relevant_chunks)} document chunks"
+                
                 response = client.chat.completions.create(
                     model=model,
-                    messages=[{"role": m["role"], "content": m["content"]} for m in st.session_state.messages],
+                    messages=messages_for_api,
                     temperature=temperature,
                     max_tokens=max_tokens,
                     top_p=top_p,
@@ -431,6 +661,10 @@ else:
                 )
                 
                 full_response = ""
+                if context_used:
+                    full_response = f"*{context_used}*\n\n"
+                    message_placeholder.markdown(full_response + "▌")
+                
                 for chunk in response:
                     if chunk.choices[0].delta.content:
                         full_response += chunk.choices[0].delta.content
