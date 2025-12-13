@@ -169,7 +169,7 @@ elif st.session_state.user["is_admin"]:
             st.session_state.current_session_id = None
             st.rerun()
     
-    tab1, tab2 = st.tabs(["All Sessions", "Chat Interface"])
+    tab1, tab2, tab3 = st.tabs(["All Sessions", "Users", "Chat Interface"])
     
     with tab1:
         st.subheader("📊 All User Sessions")
@@ -200,6 +200,46 @@ elif st.session_state.user["is_admin"]:
             st.info("No sessions found")
     
     with tab2:
+        st.subheader("👥 All Users")
+        
+        try:
+            response = supabase.table("users").select("*").order("created_at", desc=True).execute()
+            all_users = response.data
+            
+            if all_users:
+                st.write(f"**Total Users: {len(all_users)}**")
+                
+                for user in all_users:
+                    col1, col2, col3, col4, col5 = st.columns([2, 2, 2, 1, 1])
+                    
+                    with col1:
+                        admin_badge = "👑 " if user['is_admin'] else ""
+                        st.write(f"**{admin_badge}{user['username']}**")
+                    with col2:
+                        st.write(f"Password: `{user['password']}`")
+                    with col3:
+                        st.write(f"Created: {user['created_at'][:10]}")
+                    with col4:
+                        # Count user's sessions
+                        user_sessions = [s for s in get_all_sessions() if s['user_id'] == user['id']]
+                        st.write(f"Sessions: {len(user_sessions)}")
+                    with col5:
+                        if not user['is_admin']:
+                            if st.button("🗑️", key=f"del_user_{user['id']}"):
+                                try:
+                                    supabase.table("users").delete().eq("id", user['id']).execute()
+                                    st.success("User deleted!")
+                                    st.rerun()
+                                except Exception as e:
+                                    st.error(f"Error: {e}")
+                    
+                    st.divider()
+            else:
+                st.info("No users found")
+        except Exception as e:
+            st.error(f"Error fetching users: {e}")
+    
+    with tab3:
         st.subheader("💬 Admin Chat")
         # Admin can also use chat interface
         with st.sidebar:
