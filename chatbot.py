@@ -172,7 +172,7 @@ def chunk_text(text, chunk_size=800, overlap=100):
             last_newline = chunk.rfind('\n')
             break_point = max(last_period, last_newline)
             
-            if break_point > chunk_size * 0.5:  # Only break if we're past halfway
+            if break_point > chunk_size * 0.5:
                 chunk = chunk[:break_point + 1]
                 end = start + break_point + 1
         
@@ -206,7 +206,7 @@ def upload_document(session_id, filename, file):
         doc_response = supabase.table("documents").insert({
             "session_id": session_id,
             "filename": filename,
-            "content": text[:5000],  # Store first 5000 chars for preview
+            "content": text[:5000],
             "chunks": chunks
         }).execute()
         
@@ -260,6 +260,7 @@ def search_similar_chunks(session_id, query, top_k=3):
     try:
         # Generate query embedding
         query_embedding = embedding_model.encode(query).tolist()
+        query_embedding_np = np.array(query_embedding)
         
         # Get all chunks for this session
         response = supabase.table("document_chunks").select("chunk_text, embedding").eq("session_id", session_id).execute()
@@ -270,8 +271,27 @@ def search_similar_chunks(session_id, query, top_k=3):
         # Calculate cosine similarity
         chunks_with_scores = []
         for chunk_data in response.data:
-            chunk_embedding = np.array(chunk_data['embedding'])  # ADD np.array()
-            query_embedding_np = np.array(query_embedding)        # ADD this line
+            chunk_embedding = np.array(chunk_data['embedding'])
+            
+            # Cosine similarity
+            similarity = np.dot(query_embedding_np, chunk_embedding) / (
+                np.linalg.norm(query_embedding_np) * np.linalg.norm(chunk_embedding)
+            )
+            
+            chunks_with_scores.append({
+                'text': chunk_data['chunk_text'],
+                'score': similarity
+            })
+        
+        # Sort by similarity and return top_k
+        chunks_with_scores.sort(key=lambda x: x['score'], reverse=True)
+        return chunks_with_scores[:top_k]
+        
+    except Exception as e:
+        import traceback
+        st.error(f"Error searching chunks: {e}")
+        st.error(traceback.format_exc())
+        return []
 
 # Login/Register page
 if not st.session_state.user:
@@ -394,7 +414,6 @@ elif st.session_state.user["is_admin"]:
                     with col3:
                         st.write(f"Created: {user['created_at'][:10]}")
                     with col4:
-                        # Count user's sessions
                         user_sessions = [s for s in get_all_sessions() if s['user_id'] == user['id']]
                         st.write(f"Sessions: {len(user_sessions)}")
                     with col5:
@@ -415,7 +434,6 @@ elif st.session_state.user["is_admin"]:
     
     with tab3:
         st.subheader("💬 Admin Chat")
-        # Admin can also use chat interface
         with st.sidebar:
             st.header("⚙️ Settings")
             
@@ -429,7 +447,6 @@ elif st.session_state.user["is_admin"]:
             max_tokens = st.slider("Max Tokens", 256, 8192, 1024, 256)
             top_p = st.slider("Top P", 0.0, 1.0, 1.0, 0.05)
         
-        # Display chat
         for message in st.session_state.messages:
             with st.chat_message(message["role"]):
                 st.markdown(message["content"])
@@ -479,7 +496,6 @@ else:
             st.session_state.current_session_id = None
             st.rerun()
     
-    # Sidebar
     with st.sidebar:
         st.header("⚙️ Settings")
         
@@ -495,11 +511,9 @@ else:
         
         st.divider()
         
-        # RAG Settings
         st.subheader("📚 Documents (RAG)")
         use_rag = st.checkbox("Use uploaded documents", value=False, help="Enable to answer using your documents")
         
-        # File upload
         uploaded_file = st.file_uploader("Upload Document", type=['pdf', 'docx', 'txt'], help="Upload PDF, DOCX, or TXT files")
         
         if uploaded_file and st.session_state.current_session_id:
@@ -510,7 +524,6 @@ else:
         elif uploaded_file and not st.session_state.current_session_id:
             st.warning("Please start a chat session first!")
         
-        # Show uploaded documents
         if st.session_state.current_session_id:
             docs = get_session_documents(st.session_state.current_session_id)
             if docs:
@@ -526,7 +539,6 @@ else:
         
         st.divider()
         
-        # Session management
         st.subheader("💬 Chat Sessions")
         
         if st.button("➕ New Chat Session"):
@@ -537,7 +549,6 @@ else:
                 st.session_state.messages = []
                 st.rerun()
         
-        # Load existing sessions
         sessions = get_user_sessions(st.session_state.user["id"])
         
         if sessions:
@@ -564,7 +575,6 @@ else:
                                 st.session_state.messages = []
                             st.rerun()
                 
-                # Rename functionality
                 if st.session_state.get(f"editing_{session['session_id']}", False):
                     new_name = st.text_input("New name:", value=session['session_name'], key=f"name_{session['session_id']}")
                     col_save, col_cancel = st.columns(2)
@@ -587,14 +597,11 @@ else:
         if st.session_state.current_session_id:
             st.info(f"**Current:** {st.session_state.current_session_id.split('_', 1)[1]}")
     
-    # Display chat
     for message in st.session_state.messages:
         with st.chat_message(message["role"]):
             st.markdown(message["content"])
     
-    # Chat input
     if prompt := st.chat_input("Type your message here..."):
-        # Auto-create session if none exists
         if not st.session_state.current_session_id:
             session_name = generate_session_name(prompt)
             session_id = create_session(st.session_state.user["id"], session_name)
@@ -609,19 +616,15 @@ else:
             message_placeholder = st.empty()
             
             try:
-                # Prepare messages for API
                 messages_for_api = [{"role": m["role"], "content": m["content"]} for m in st.session_state.messages]
                 
-                # If RAG is enabled, search for relevant context
                 context_used = None
                 if use_rag and st.session_state.current_session_id:
                     relevant_chunks = search_similar_chunks(st.session_state.current_session_id, prompt, top_k=3)
                     
                     if relevant_chunks:
-                        # Build context from chunks
                         context = "\n\n".join([f"[Context {i+1}]: {chunk['text']}" for i, chunk in enumerate(relevant_chunks)])
                         
-                        # Modify the last user message to include context
                         enhanced_prompt = f"""Based on the following context from uploaded documents, please answer the question.
 
 Context:
@@ -656,7 +659,6 @@ Please provide a detailed answer based on the context above. If the context does
                 message_placeholder.markdown(full_response)
                 st.session_state.messages.append({"role": "assistant", "content": full_response})
                 
-                # Save to database
                 if st.session_state.current_session_id:
                     save_session(st.session_state.current_session_id, st.session_state.messages)
                 
