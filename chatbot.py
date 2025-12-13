@@ -179,7 +179,7 @@ elif st.session_state.user["is_admin"]:
             st.write(f"**Total Sessions: {len(all_sessions)}**")
             
             for session in all_sessions:
-                col1, col2, col3, col4 = st.columns([2, 2, 1, 1])
+                col1, col2, col3, col4, col5 = st.columns([2, 2, 1, 1, 1])
                 
                 with col1:
                     st.write(f"**{session['session_name']}**")
@@ -190,10 +190,27 @@ elif st.session_state.user["is_admin"]:
                 with col3:
                     st.write(f"Messages: {len(session['messages'])}")
                 with col4:
+                    if st.button("👁️", key=f"view_{session['session_id']}", help="View messages"):
+                        st.session_state[f"viewing_{session['session_id']}"] = not st.session_state.get(f"viewing_{session['session_id']}", False)
+                        st.rerun()
+                with col5:
                     if st.button("🗑️", key=f"del_admin_{session['session_id']}"):
                         if delete_session(session['session_id']):
                             st.success("Deleted!")
                             st.rerun()
+                
+                # Show messages if viewing
+                if st.session_state.get(f"viewing_{session['session_id']}", False):
+                    with st.expander("💬 Conversation", expanded=True):
+                        if session['messages']:
+                            for idx, msg in enumerate(session['messages']):
+                                role_icon = "👤" if msg['role'] == 'user' else "🤖"
+                                st.markdown(f"**{role_icon} {msg['role'].title()}:**")
+                                st.markdown(msg['content'])
+                                if idx < len(session['messages']) - 1:
+                                    st.markdown("---")
+                        else:
+                            st.info("No messages in this session")
                 
                 st.divider()
         else:
