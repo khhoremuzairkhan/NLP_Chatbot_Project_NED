@@ -270,25 +270,8 @@ def search_similar_chunks(session_id, query, top_k=3):
         # Calculate cosine similarity
         chunks_with_scores = []
         for chunk_data in response.data:
-            chunk_embedding = chunk_data['embedding']
-            
-            # Cosine similarity
-            similarity = np.dot(query_embedding, chunk_embedding) / (
-                np.linalg.norm(query_embedding) * np.linalg.norm(chunk_embedding)
-            )
-            
-            chunks_with_scores.append({
-                'text': chunk_data['chunk_text'],
-                'score': similarity
-            })
-        
-        # Sort by similarity and return top_k
-        chunks_with_scores.sort(key=lambda x: x['score'], reverse=True)
-        return chunks_with_scores[:top_k]
-        
-    except Exception as e:
-        st.error(f"Error searching chunks: {e}")
-        return []
+            chunk_embedding = np.array(chunk_data['embedding'])  # ADD np.array()
+            query_embedding_np = np.array(query_embedding)        # ADD this line
 
 # Login/Register page
 if not st.session_state.user:
