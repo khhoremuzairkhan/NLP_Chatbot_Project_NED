@@ -219,16 +219,17 @@ def upload_document(session_id, filename, file):
         # Generate embeddings and store chunks
         with st.spinner(f"Processing {len(chunks)} chunks..."):
             for idx, chunk in enumerate(chunks):
-                # Generate embedding
-                embedding = embedding_model.encode(chunk).tolist()
+                # Generate embedding as list
+                embedding_vector = embedding_model.encode(chunk).tolist()
                 
                 # Store chunk with embedding
+                # Note: supabase-py will convert the list to the proper vector format
                 supabase.table("document_chunks").insert({
                     "document_id": document_id,
                     "session_id": session_id,
                     "chunk_text": chunk,
                     "chunk_index": idx,
-                    "embedding": embedding
+                    "embedding": embedding_vector  # Pass as list, Supabase handles conversion
                 }).execute()
         
         return True
@@ -260,7 +261,7 @@ def search_similar_chunks(session_id, query, top_k=3):
     try:
         # Generate query embedding
         query_embedding = embedding_model.encode(query).tolist()
-        query_embedding_np = np.array(query_embedding)
+        query_embedding_np = np.array(query_embedding, dtype=np.float32)
         
         # Get all chunks for this session
         response = supabase.table("document_chunks").select("chunk_text, embedding").eq("session_id", session_id).execute()
@@ -271,7 +272,18 @@ def search_similar_chunks(session_id, query, top_k=3):
         # Calculate cosine similarity
         chunks_with_scores = []
         for chunk_data in response.data:
-            chunk_embedding = np.array(chunk_data['embedding'])
+            embedding_data = chunk_data['embedding']
+            
+            # Parse embedding - supabase returns vector as string like "[-0.123, 0.456, ...]"
+            if isinstance(embedding_data, str):
+                # Remove brackets and parse
+                embedding_data = embedding_data.strip('[]')
+                chunk_embedding = np.array([float(x.strip()) for x in embedding_data.split(',')], dtype=np.float32)
+            elif isinstance(embedding_data, list):
+                chunk_embedding = np.array(embedding_data, dtype=np.float32)
+            else:
+                # Already a numpy array or similar
+                chunk_embedding = np.array(embedding_data, dtype=np.float32)
             
             # Cosine similarity
             similarity = np.dot(query_embedding_np, chunk_embedding) / (
@@ -280,7 +292,7 @@ def search_similar_chunks(session_id, query, top_k=3):
             
             chunks_with_scores.append({
                 'text': chunk_data['chunk_text'],
-                'score': similarity
+                'score': float(similarity)
             })
         
         # Sort by similarity and return top_k
